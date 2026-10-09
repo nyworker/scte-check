@@ -4,7 +4,9 @@
 Usage: python scte35_check.py <file.ts> [file2.ts ...]
 """
 
+import queue
 import sys
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
@@ -14,6 +16,7 @@ SYNC_BYTE = 0x47
 PAT_PID = 0
 SCTE35_STREAM_TYPE = 0x86
 PTS_MAX = 1 << 33  # 33-bit PTS wraps at ~26.5 hours
+READ_CHUNK_PACKETS = 16384  # packets per file read (~3 MB)
 
 # Stream types that carry PES with PTS (video / audio)
 PES_STREAM_TYPES = {
@@ -282,6 +285,36 @@ def _parse_scte35_section(data: bytes, pid: int, program: int,
     return event
 
 
+# ── Chunked reader ────────────────────────────────────────────────────────────
+
+def _read_chunks(f, chunk_size: int, prefetch: int = 4):
+    """Yield chunks from f, reading ahead on a background thread.
+
+    file.read() releases the GIL, so on slow storage (e.g. network shares)
+    I/O overlaps with parsing instead of alternating with it.
+    """
+    q: queue.Queue = queue.Queue(maxsize=prefetch)
+
+    def reader():
+        try:
+            while True:
+                chunk = f.read(chunk_size)
+                q.put(chunk)
+                if len(chunk) < chunk_size:
+                    return
+        except BaseException as e:
+            q.put(e)
+
+    threading.Thread(target=reader, daemon=True).start()
+    while True:
+        chunk = q.get()
+        if isinstance(chunk, BaseException):
+            raise chunk
+        yield chunk
+        if len(chunk) < chunk_size:
+            return
+
+
 # ── TS parser ─────────────────────────────────────────────────────────────────
 
 class TSParser:
@@ -312,16 +345,31 @@ class TSParser:
             else:
                 prefix = 0
 
-            while True:
-                if prefix:
-                    f.read(prefix)
-                raw = f.read(TS_PACKET_SIZE)
-                if len(raw) < TS_PACKET_SIZE:
-                    break
-                if raw[0] != SYNC_BYTE:
-                    continue
-                self._process_packet(raw)
-                self.packet_count += 1
+            stride = prefix + TS_PACKET_SIZE
+            chunk_size = stride * READ_CHUNK_PACKETS
+            es_pids = self.es_pids
+            count = 0
+
+            for buf in _read_chunks(f, chunk_size):
+                for start in range(prefix, len(buf) - TS_PACKET_SIZE + 1, stride):
+                    if buf[start] != SYNC_BYTE:
+                        continue
+                    # Fast path: skip packets that can't change parser state.
+                    # The bulk of a stream is ES continuation packets (no PUSI)
+                    # whose only interest is a possible PCR.
+                    b1 = buf[start + 1]
+                    pid = ((b1 & 0x1F) << 8) | buf[start + 2]
+                    if (pid in es_pids and not (b1 & 0x40)
+                            and (pid != self.pcr_pid
+                                 or not (buf[start + 3] & 0x20)
+                                 or buf[start + 4] < 6
+                                 or not (buf[start + 5] & 0x10))):
+                        count += 1
+                        continue
+                    self.packet_count = count
+                    self._process_packet(buf[start:start + TS_PACKET_SIZE])
+                    count += 1
+            self.packet_count = count
 
     def _process_packet(self, pkt: bytes) -> None:
         pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
