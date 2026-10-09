@@ -71,6 +71,19 @@ Ad Break Summary
 | `splice_insert` (0x05) | Full detail — OUT/IN/CANCEL, times, duration, avail info |
 | `splice_null`, `time_signal`, etc. | Listed in "Other SCTE-35 Commands" section |
 
+## Performance
+
+The file is read in ~3 MB chunks on a background read-ahead thread, and video/audio continuation packets (which can't change parser state) are skipped without full parsing.
+
+Measured on a 357 MB recording (1.9M packets, 1 hour), Python 3.14:
+
+| Scenario | Before | After |
+|---|---|---|
+| File in page cache | 0.67s | 0.42s |
+| Cold read from a gigabit CIFS share | 3.3s | 3.2s |
+
+On network storage the run is I/O-bound: parsing now overlaps the read, so total time is roughly the time to copy the file (~112 MB/s on gigabit). For faster results, run it on the machine that holds the recordings or on a local copy.
+
 ## Requirements
 
 Python 3.7+, stdlib only.
